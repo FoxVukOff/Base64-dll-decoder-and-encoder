@@ -13,11 +13,13 @@ const c = {
   dim: "\x1b[2m",
   green: "\x1b[32m",
   cyan: "\x1b[36m",
-  magenta: "\x1b[35m",
-  yellow: "\x1b[33m",
-  blue: "\x1b[34m",
   red: "\x1b[31m"
 };
+
+function cleanPath(p) {
+  if (!p) return p;
+  return p.replace(/^["']|["']$/g, '').trim();
+}
 
 function encodeContent(content) {
   return Buffer.from(content, 'utf-8').toString('base64');
@@ -43,19 +45,19 @@ async function sleep(ms) {
 async function main() {
   console.clear();
   console.log(`${c.cyan}${c.bright}================================================${c.reset}`);
-  console.log(`${c.bright}${c.green}      BASE64 DLL ENCODER & DECODER v0.0.3     ${c.reset}`);
+  console.log(`${c.bright}${c.cyan}      BASE64 DLL ENCODER & DECODER v0.0.4     ${c.reset}`);
   console.log(`${c.cyan}${c.bright}================================================${c.reset}\n`);
   
   while (true) {
     try {
-      const menu = `${c.yellow}Выберите режим:\n${c.reset}` +
-        `[1] ${c.cyan}Текст -> DLL${c.reset} (классическое кодирование)\n` +
-        `[2] ${c.magenta}DLL -> Текст${c.reset} (создание .txt из dll)\n` +
-        `[3] ${c.blue}Файл -> DLL${c.reset} (превратить любой формат в .dll)\n` +
-        `[4] ${c.green}DLL -> Файл${c.reset} (раскодировать .dll в исходный формат)\n` +
-        `[5] ${c.yellow}Инфо о DLL${c.reset} (анализатор файла)\n` +
-        `[0] ${c.red}Выход из программы${c.reset}\n\n` +
-        `${c.bright}> ${c.reset}`;
+      const menu = `${c.bright}Выберите режим:\n${c.reset}` +
+        `${c.cyan}[1]${c.reset} Текст -> DLL (классическое кодирование)\n` +
+        `${c.cyan}[2]${c.reset} DLL -> Текст (создание .txt из dll)\n` +
+        `${c.cyan}[3]${c.reset} Файл -> DLL (любой формат в .dll)\n` +
+        `${c.cyan}[4]${c.reset} DLL -> Файл (раскодировать .dll в исходный формат)\n` +
+        `${c.cyan}[5]${c.reset} Инфо о DLL (информация о файле)\n` +
+        `${c.cyan}[0]${c.reset} Выход из программы\n\n` +
+        `${c.cyan}> ${c.reset}`;
         
       const mode = await rl.question(menu);
 
@@ -64,7 +66,7 @@ async function main() {
         break;
       } else if (mode.trim() === '1') {
       console.log(`\n${c.cyan}--- ТЕКСТ В DLL ---${c.reset}`);
-      const name = await rl.question(`${c.bright}Введите имя файла (без .dll): ${c.reset}`);
+      let name = cleanPath(await rl.question(`${c.bright}Введите имя файла (без .dll): ${c.reset}`));
       const content = await rl.question(`${c.bright}Введите содержание (текст): ${c.reset}`);
       
       process.stdout.write(`\n${c.dim}Кодирование...${c.reset}`);
@@ -76,10 +78,10 @@ async function main() {
       console.log(`\r${c.green}${c.bright}УСПЕХ! Текст зашифрован и сохранен в "${name}.dll".${c.reset}\n`);
 
     } else if (mode.trim() === '2') {
-      console.log(`\n${c.magenta}--- DLL В ТЕКСТ ---${c.reset}`);
-      const name = await rl.question(`${c.bright}Введите полное имя файла (с .dll) или только имя: ${c.reset}`);
-      let fileName = name.endsWith('.dll') ? name : `${name}.dll`;
-      let outName = name.endsWith('.dll') ? name.slice(0, -4) : name;
+      console.log(`\n${c.cyan}--- DLL В ТЕКСТ ---${c.reset}`);
+      let name = cleanPath(await rl.question(`${c.bright}Введите полное имя файла (с .dll) или только имя: ${c.reset}`));
+      let fileName = name.toLowerCase().endsWith('.dll') ? name : `${name}.dll`;
+      let outName = name.toLowerCase().endsWith('.dll') ? name.slice(0, -4) : name;
       
       process.stdout.write(`\n${c.dim}Чтение и декодирование...${c.reset}`);
       await sleep(400);
@@ -98,8 +100,8 @@ async function main() {
       }
 
     } else if (mode.trim() === '3') {
-      console.log(`\n${c.blue}--- ЛЮБОЙ ФАЙЛ В BASE64 DLL ---${c.reset}`);
-      const filePath = await rl.question(`${c.bright}Введите путь или имя исходного файла (например, image.png): ${c.reset}`);
+      console.log(`\n${c.cyan}--- ЛЮБОЙ ФАЙЛ В BASE64 DLL ---${c.reset}`);
+      let filePath = cleanPath(await rl.question(`${c.bright}Введите путь или имя исходного файла (можно перетащить в окно): ${c.reset}`));
       
       try {
         const stats = await fs.stat(filePath);
@@ -125,8 +127,11 @@ async function main() {
       }
 
     } else if (mode.trim() === '4') {
-      console.log(`\n${c.green}--- DLL В ИСХОДНЫЙ ФОРМАТ ---${c.reset}`);
-      const filePath = await rl.question(`${c.bright}Введите имя .dll файла (например, image.png.dll): ${c.reset}`);
+      console.log(`\n${c.cyan}--- DLL В ИСХОДНЫЙ ФОРМАТ ---${c.reset}`);
+      let filePath = cleanPath(await rl.question(`${c.bright}Введите имя .dll файла (можно перетащить в окно): ${c.reset}`));
+      if (!filePath.toLowerCase().endsWith('.dll')) {
+        try { await fs.access(filePath); } catch { filePath += '.dll'; }
+      }
       
       try {
         process.stdout.write(`\n${c.dim}Чтение закодированных данных...${c.reset}`);
@@ -161,8 +166,11 @@ async function main() {
       }
 
     } else if (mode.trim() === '5') {
-      console.log(`\n${c.yellow}--- АНАЛИЗАТОР Base64 DLL ---${c.reset}`);
-      const filePath = await rl.question(`${c.bright}Введите путь или имя .dll файла: ${c.reset}`);
+      console.log(`\n${c.cyan}--- ИНФО О DLL ---${c.reset}`);
+      let filePath = cleanPath(await rl.question(`${c.bright}Введите путь или имя .dll файла: ${c.reset}`));
+      if (!filePath.toLowerCase().endsWith('.dll')) {
+        try { await fs.access(filePath); } catch { filePath += '.dll'; }
+      }
       
       try {
         const stats = await fs.stat(filePath);
