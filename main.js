@@ -1,6 +1,7 @@
 const fs = require('fs/promises');
 const readline = require('readline/promises');
 const path = require('path');
+const crypto = require('crypto');
 
 const rl = readline.createInterface({
   input: process.stdin,
@@ -42,11 +43,56 @@ async function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Безопасная атомная запись файла: сначала пишем во временный, потом переименовываем
+// Это блокирует повреждение файлов при краше или резком закрытии программы.
+async function safeWriteFile(filePath, data) {
+  const tempPath = `${filePath}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  try {
+    await fs.writeFile(tempPath, data);
+    await fs.rename(tempPath, filePath);
+  } catch (err) {
+    try { await fs.unlink(tempPath); } catch (e) {} // очистка мусора при ошибке
+    throw err;
+  }
+}
+
+// Магические байты для автоопределения форматов
+function detectSignature(buffer) {
+  if (buffer.length < 4) return null;
+  const hex = buffer.toString('hex', 0, 4).toUpperCase();
+  if (hex.startsWith('89504E47')) return '.png';
+  if (hex.startsWith('FFD8FF')) return '.jpg';
+  if (hex.startsWith('25504446')) return '.pdf';
+  if (hex.startsWith('504B0304')) return '.zip'; // Также docx, xlsx, apk
+  if (hex.startsWith('52617221')) return '.rar';
+  if (hex.startsWith('4D5A')) return '.exe';
+  if (hex.startsWith('494433')) return '.mp3';
+  if (hex.startsWith('52494646')) {
+    const format = buffer.toString('ascii', 8, 12);
+    if (format === 'WEBP') return '.webp';
+    if (format === 'WAVE') return '.wav';
+    if (format === 'AVI ') return '.avi';
+  }
+  if (hex.startsWith('000000') && buffer.length >= 8) {
+    const ftyp = buffer.toString('ascii', 4, 8);
+    if (ftyp === 'ftyp') return '.mp4';
+  }
+  return null;
+}
+
 async function main() {
   console.clear();
-  console.log(`${c.cyan}${c.bright}================================================${c.reset}`);
-  console.log(`${c.bright}${c.cyan}      BASE64 DLL ENCODER & DECODER v0.0.4     ${c.reset}`);
-  console.log(`${c.cyan}${c.bright}================================================${c.reset}\n`);
+  const logo = `
+${c.bright}${c.cyan} ____                 __   _  _        ____  _     _     
+| __ )  __ _ ___  ___/ /_ | || |      |  _ \\| |   | |    
+|  _ \\ / _\` / __|/ _ \\ '_ \\| || |_     | | | | |   | |    
+| |_) | (_| \\__ \\  __/ (_) |__   _|    | |_| | |___| |___ 
+|____/ \\__,_|___/\\___|\\___/   |_|      |____/|_____|_____|${c.reset}
+`;
+  console.log(logo);
+  console.log(`${c.cyan}${c.bright}==========================================================${c.reset}`);
+  console.log(`${c.bright}${c.cyan}           BASE64 DLL ENCODER & DECODER v0.0.5          ${c.reset}`);
+  console.log(`${c.cyan}${c.bright}==========================================================${c.reset}\n`);
   
   while (true) {
     try {
@@ -73,7 +119,7 @@ async function main() {
       await sleep(400); // Небольшая задержка для эффекта
       
       const encodedContent = encodeContent(content);
-      await fs.writeFile(`${name}.dll`, encodedContent);
+      await safeWriteFile(`${name}.dll`, encodedContent);
       
       console.log(`\r${c.green}${c.bright}УСПЕХ! Текст зашифрован и сохранен в "${name}.dll".${c.reset}\n`);
 
@@ -89,7 +135,7 @@ async function main() {
       try {
         const data = await fs.readFile(fileName, 'utf-8');
         const decodedContent = decodeContent(data);
-        await fs.writeFile(`${outName}.txt`, decodedContent);
+        await safeWriteFile(`${outName}.txt`, decodedContent);
         console.log(`\r${c.green}${c.bright}УСПЕХ! Файл "${fileName}" декодирован в "${outName}.txt".${c.reset}\n`);
       } catch (e) {
         if (e.code === 'ENOENT') {
@@ -115,7 +161,7 @@ async function main() {
         const base64Data = fileBuffer.toString('base64');
         const outFileName = `${path.basename(filePath)}.dll`;
         
-        await fs.writeFile(outFileName, base64Data);
+        await safeWriteFile(outFileName, base64Data);
         
         console.log(`\r${c.green}${c.bright}УСПЕХ! Файл "${path.basename(filePath)}" превращен в "${outFileName}".${c.reset} \n${c.dim}Размер DLL: ${formatBytes(base64Data.length)}${c.reset}\n`);
       } catch (e) {
@@ -153,8 +199,15 @@ async function main() {
             outFileName += "_decoded";
         }
         
-        // Если пользователь переименовал dll и обрезал формат, мы не сможем его магически узнать
-        await fs.writeFile(outFileName, originalBuffer);
+        // Попытка угадать расширение по магическим байтам, если его нет
+        if (!outFileName.includes('.') || outFileName.endsWith('_decoded')) {
+            const detectedExt = detectSignature(originalBuffer);
+            if (detectedExt) {
+                outFileName += detectedExt;
+            }
+        }
+        
+        await safeWriteFile(outFileName, originalBuffer);
         
         console.log(`\r${c.green}${c.bright}УСПЕХ! DLL декодирован обратно в файл "${outFileName}".${c.reset} \n${c.dim}Восстановленный размер: ${formatBytes(originalBuffer.length)}${c.reset}\n`);
       } catch (e) {
