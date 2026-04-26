@@ -1,7 +1,9 @@
 const fs = require('fs/promises');
+const fsSync = require('fs');
 const readline = require('readline/promises');
 const path = require('path');
 const crypto = require('crypto');
+const { exec } = require('child_process');
 
 const rl = readline.createInterface({
   input: process.stdin,
@@ -43,6 +45,21 @@ async function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function copyToClipboard(text) {
+  return new Promise((resolve) => {
+    if (process.platform === 'win32') {
+      const proc = exec('clip', (err) => resolve(!err));
+      proc.stdin.write(text);
+      proc.stdin.end();
+      setTimeout(resolve, 1500);
+    } else {
+      resolve(false);
+    }
+  });
+}
+
+const META_TAG = '\n//_B64DLL_TOOL_SIG_//';
+
 // Безопасная атомная запись файла: сначала пишем во временный, потом переименовываем
 // Это блокирует повреждение файлов при краше или резком закрытии программы.
 async function safeWriteFile(filePath, data) {
@@ -54,6 +71,88 @@ async function safeWriteFile(filePath, data) {
     try { await fs.unlink(tempPath); } catch (e) {} // очистка мусора при ошибке
     throw err;
   }
+}
+
+async function encodeFileStream(inPath, outPath) {
+  const tempPath = `${outPath}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  await new Promise((resolve, reject) => {
+    const rs = fsSync.createReadStream(inPath);
+    const ws = fsSync.createWriteStream(tempPath);
+    let leftover = Buffer.alloc(0);
+
+    rs.on('data', chunk => {
+      const combined = Buffer.concat([leftover, chunk]);
+      const remainder = combined.length % 3;
+      const toEncode = combined.subarray(0, combined.length - remainder);
+      leftover = combined.subarray(combined.length - remainder);
+      if (toEncode.length > 0) {
+        ws.write(toEncode.toString('base64'));
+      }
+    });
+
+    rs.on('end', () => {
+      if (leftover.length > 0) {
+        ws.write(leftover.toString('base64'));
+      }
+      ws.write(META_TAG);
+      ws.end();
+    });
+
+    ws.on('finish', resolve);
+    rs.on('error', err => { ws.end(); fsSync.unlink(tempPath, ()=>{}); reject(err); });
+    ws.on('error', err => { rs.destroy(); fsSync.unlink(tempPath, ()=>{}); reject(err); });
+  });
+  await fs.rename(tempPath, outPath);
+}
+
+async function decodeFileStream(inPath, currentOutFileName) {
+  const tempPath = `${currentOutFileName}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  await new Promise((resolve, reject) => {
+    const rs = fsSync.createReadStream(inPath, { encoding: 'utf8', highWaterMark: 64 * 1024 });
+    const ws = fsSync.createWriteStream(tempPath);
+    let b64Leftover = '';
+
+    rs.on('data', chunk => {
+      let text = b64Leftover + chunk;
+      const sigIndex = text.indexOf('//_B64DLL_TOOL_SIG_//');
+      if (sigIndex !== -1) text = text.slice(0, sigIndex);
+      text = text.replace(/[^A-Za-z0-9+/=]/g, '');
+
+      const remainder = text.length % 4;
+      const toDecode = text.slice(0, text.length - remainder);
+      b64Leftover = text.slice(text.length - remainder);
+
+      if (toDecode.length > 0) {
+        ws.write(Buffer.from(toDecode, 'base64'));
+      }
+    });
+
+    rs.on('end', () => {
+      const sigIndex = b64Leftover.indexOf('//_B64DLL_TOOL_SIG_//');
+      if (sigIndex !== -1) b64Leftover = b64Leftover.slice(0, sigIndex);
+      b64Leftover = b64Leftover.replace(/[^A-Za-z0-9+/=]/g, '');
+      if (b64Leftover.length > 0) ws.write(Buffer.from(b64Leftover, 'base64'));
+      ws.end();
+    });
+
+    ws.on('finish', resolve);
+    rs.on('error', err => { ws.end(); fsSync.unlink(tempPath, ()=>{}); reject(err); });
+    ws.on('error', err => { rs.destroy(); fsSync.unlink(tempPath, ()=>{}); reject(err); });
+  });
+  
+  let finalOutFileName = currentOutFileName;
+  if (!finalOutFileName.includes('.') || finalOutFileName.endsWith('_decoded')) {
+      const fd = await fs.open(tempPath, 'r');
+      const peakBuf = Buffer.alloc(8);
+      const bytesRead = (await fd.read(peakBuf, 0, 8, 0)).bytesRead;
+      await fd.close();
+      if (bytesRead > 0) {
+          const detectedExt = detectSignature(peakBuf.subarray(0, bytesRead));
+          if (detectedExt) finalOutFileName += detectedExt;
+      }
+  }
+  await fs.rename(tempPath, finalOutFileName);
+  return finalOutFileName;
 }
 
 // Магические байты для автоопределения форматов
@@ -91,7 +190,7 @@ ${c.bright}${c.cyan} ____                 __   _  _        ____  _     _
 `;
   console.log(logo);
   console.log(`${c.cyan}${c.bright}==========================================================${c.reset}`);
-  console.log(`${c.bright}${c.cyan}           BASE64 DLL ENCODER & DECODER v0.0.5          ${c.reset}`);
+  console.log(`${c.bright}${c.cyan}           BASE64 DLL ENCODER & DECODER v0.0.6          ${c.reset}`);
   console.log(`${c.cyan}${c.bright}==========================================================${c.reset}\n`);
   
   while (true) {
@@ -118,7 +217,7 @@ ${c.bright}${c.cyan} ____                 __   _  _        ____  _     _
       process.stdout.write(`\n${c.dim}Кодирование...${c.reset}`);
       await sleep(400); // Небольшая задержка для эффекта
       
-      const encodedContent = encodeContent(content);
+      const encodedContent = encodeContent(content) + META_TAG;
       await safeWriteFile(`${name}.dll`, encodedContent);
       
       console.log(`\r${c.green}${c.bright}УСПЕХ! Текст зашифрован и сохранен в "${name}.dll".${c.reset}\n`);
@@ -133,10 +232,21 @@ ${c.bright}${c.cyan} ____                 __   _  _        ____  _     _
       await sleep(400);
 
       try {
-        const data = await fs.readFile(fileName, 'utf-8');
-        const decodedContent = decodeContent(data);
+        let rawData = await fs.readFile(fileName, 'utf-8');
+        if (rawData.includes('//_B64DLL_TOOL_SIG_//')) {
+             rawData = rawData.replace('//_B64DLL_TOOL_SIG_//', '');
+        }
+        const decodedContent = decodeContent(rawData.replace(/[^A-Za-z0-9+/=]/g, ''));
         await safeWriteFile(`${outName}.txt`, decodedContent);
-        console.log(`\r${c.green}${c.bright}УСПЕХ! Файл "${fileName}" декодирован в "${outName}.txt".${c.reset}\n`);
+        console.log(`\r${c.green}${c.bright}УСПЕХ! Файл "${fileName}" декодирован в "${outName}.txt".${c.reset}`);
+        
+        const answer = await rl.question(`${c.cyan}Скопировать текст в буфер обмена? (y/n): ${c.reset}`);
+        if (answer.toLowerCase() === 'y' || answer.toLowerCase() === 'н') {
+             await copyToClipboard(decodedContent);
+             console.log(`${c.green}Текст успешно скопирован в буфер обмена!${c.reset}\n`);
+        } else {
+             console.log();
+        }
       } catch (e) {
         if (e.code === 'ENOENT') {
           console.log(`\r${c.red}${c.bright}ОШИБКА: Файл "${fileName}" не найден в папке с программой!${c.reset}\n`);
@@ -153,17 +263,13 @@ ${c.bright}${c.cyan} ____                 __   _  _        ____  _     _
         const stats = await fs.stat(filePath);
         process.stdout.write(`\n${c.dim}Чтение файла (${formatBytes(stats.size)})...${c.reset}`);
         
-        const fileBuffer = await fs.readFile(filePath);
+        process.stdout.write(`\r${c.dim}Пакетное кодирование (потоком)...${c.reset}               `);
         
-        process.stdout.write(`\r${c.dim}Кодирование данных в Base64...${c.reset}               `);
-        await sleep(500);
-        
-        const base64Data = fileBuffer.toString('base64');
         const outFileName = `${path.basename(filePath)}.dll`;
+        await encodeFileStream(filePath, outFileName);
         
-        await safeWriteFile(outFileName, base64Data);
-        
-        console.log(`\r${c.green}${c.bright}УСПЕХ! Файл "${path.basename(filePath)}" превращен в "${outFileName}".${c.reset} \n${c.dim}Размер DLL: ${formatBytes(base64Data.length)}${c.reset}\n`);
+        const outStats = await fs.stat(outFileName);
+        console.log(`\r${c.green}${c.bright}УСПЕХ! Файл "${path.basename(filePath)}" превращен в "${outFileName}".${c.reset} \n${c.dim}Размер DLL: ${formatBytes(outStats.size)}${c.reset}\n`);
       } catch (e) {
         if (e.code === 'ENOENT') {
           console.log(`\r${c.red}${c.bright}ОШИБКА: Файл "${filePath}" не найден!${c.reset}\n`);
@@ -182,16 +288,8 @@ ${c.bright}${c.cyan} ____                 __   _  _        ____  _     _
       try {
         process.stdout.write(`\n${c.dim}Чтение закодированных данных...${c.reset}`);
         
-        const base64Data = await fs.readFile(filePath, 'utf-8');
+        process.stdout.write(`\r${c.dim}Потоковое декодирование и восстановление...${c.reset}        `);
         
-        process.stdout.write(`\r${c.dim}Декодирование и восстановление файла...${c.reset}        `);
-        await sleep(500);
-        
-        const originalBuffer = Buffer.from(base64Data, 'base64');
-        
-        // Попытка восстановить оригинальное имя.
-        // Если файл называется "video.mp4.dll", он станет "video.mp4". 
-        // Иначе добавим приписку "_decoded".
         let outFileName = filePath;
         if (outFileName.toLowerCase().endsWith('.dll')) {
             outFileName = outFileName.slice(0, -4);
@@ -199,17 +297,10 @@ ${c.bright}${c.cyan} ____                 __   _  _        ____  _     _
             outFileName += "_decoded";
         }
         
-        // Попытка угадать расширение по магическим байтам, если его нет
-        if (!outFileName.includes('.') || outFileName.endsWith('_decoded')) {
-            const detectedExt = detectSignature(originalBuffer);
-            if (detectedExt) {
-                outFileName += detectedExt;
-            }
-        }
+        const finalOutName = await decodeFileStream(filePath, outFileName);
         
-        await safeWriteFile(outFileName, originalBuffer);
-        
-        console.log(`\r${c.green}${c.bright}УСПЕХ! DLL декодирован обратно в файл "${outFileName}".${c.reset} \n${c.dim}Восстановленный размер: ${formatBytes(originalBuffer.length)}${c.reset}\n`);
+        const outStats = await fs.stat(finalOutName);
+        console.log(`\r${c.green}${c.bright}УСПЕХ! DLL декодирован обратно в файл "${finalOutName}".${c.reset} \n${c.dim}Восстановленный размер: ${formatBytes(outStats.size)}${c.reset}\n`);
       } catch (e) {
         if (e.code === 'ENOENT') {
           console.log(`\r${c.red}${c.bright}ОШИБКА: Файл "${filePath}" не найден!${c.reset}\n`);
@@ -230,11 +321,22 @@ ${c.bright}${c.cyan} ____                 __   _  _        ____  _     _
         const fd = await fs.open(filePath, 'r');
         const buffer = Buffer.alloc(100);
         await fd.read(buffer, 0, 100, 0);
+        
+        // Чтение конца файла для проверки сигнатуры
+        const tailBuf = Buffer.alloc(100);
+        const readEndPos = Math.max(0, stats.size - 100);
+        await fd.read(tailBuf, 0, 100, readEndPos);
         await fd.close();
+        
+        const isSigned = tailBuf.toString('utf-8').includes('//_B64DLL_TOOL_SIG_//');
         
         console.log(`\n${c.cyan}${c.bright}>>> ДЕТАЛИ ФАЙЛА <<<${c.reset}`);
         console.log(`${c.bright}• Имя файла: ${c.reset}${path.basename(filePath)}`);
         console.log(`${c.bright}• Размер на диске: ${c.reset}${formatBytes(stats.size)}`);
+        
+        if (isSigned) {
+            console.log(`${c.green}${c.bright}• Подтверждено: закодировано через Base64 DLL Tool (метка найдена)${c.reset}`);
+        }
         
         const originalSizeApprox = Math.floor((stats.size / 4) * 3);
         console.log(`${c.bright}• Ожидаемый размер после декода: ${c.reset}~${formatBytes(originalSizeApprox)}`);
