@@ -340,7 +340,7 @@ async function decodeFileStream(inPath, currentOutFileName, password) {
   // Извлекаем хеш из оригинального файла (теги уже были удалены в стриме)
   let storedHashes = null;
   if (hasHashTag) {
-    const hashProbe = probeText.match(/\/\/_B64DLL_HASH_\/\/(.*?)\/\/_B64DLL_HASH_\/\//);
+    const hashProbe = probeText.match(/\/\/_B64DLL_HASH_\/\/([\s\S]*?)\/\/_B64DLL_HASH_\/\//);
     if (hashProbe) storedHashes = decodeHashTag(hashProbe[1]);
   }
 
@@ -610,7 +610,7 @@ ${c.bright}${c.cyan} ____                 __   _  _        ____  _     _
 
             // Проверяем наличие тега хеша
             let storedHashes = null;
-            const hashMatch = rawData.match(/\/\/_B64DLL_HASH_\/\/(.*?)\/\/_B64DLL_HASH_\/\//);
+            const hashMatch = rawData.match(/\/\/_B64DLL_HASH_\/\/([\s\S]*?)\/\/_B64DLL_HASH_\/\//);
             if (hashMatch) {
               storedHashes = decodeHashTag(hashMatch[1]);
             }
@@ -622,7 +622,7 @@ ${c.bright}${c.cyan} ____                 __   _  _        ____  _     _
                  rawData = rawData.replace('//_B64DLL_PWD_//', '');
             }
             if (hashMatch) {
-              rawData = rawData.replace(/\/\/_B64DLL_HASH_\/\/.*?\/\/_B64DLL_HASH_\/\//, '');
+              rawData = rawData.replace(/\/\/_B64DLL_HASH_\/\/[\s\S]*?\/\/_B64DLL_HASH_\/\//g, '');
             }
 
             let decodedBuffer = Buffer.from(rawData.replace(/[^A-Za-z0-9+/=]/g, ''), 'base64');
