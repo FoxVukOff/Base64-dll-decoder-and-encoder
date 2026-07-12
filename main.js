@@ -61,8 +61,8 @@ function encodeHashTag(hashes) {
 }
 
 function decodeHashTag(tagContent) {
-  const parts = tagContent.split('|');
-  if (parts.length === 2) return { md5: parts[0], sha256: parts[1] };
+  const parts = tagContent.trim().split('|');
+  if (parts.length === 2) return { md5: parts[0].trim(), sha256: parts[1].trim() };
   return null;
 }
 
