@@ -3,7 +3,7 @@ title Build Base64 DLL Tool
 color 0a
 
 echo =========================================
-echo    Building Base64 DLL Tool (v0.0.6)
+echo    Building Base64 DLL Tool (v0.0.7)
 echo =========================================
 echo.
 echo Please wait, compiling main.js to executable...
