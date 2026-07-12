@@ -6,8 +6,10 @@ const crypto = require('crypto');
 const { exec } = require('child_process');
 const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
 
-const APP_VERSION = '0.0.7';
+const APP_VERSION = '0.0.8';
 const META_TAG = '\n//_B64DLL_TOOL_SIG_//';
+const HASH_TAG = '\n//_B64DLL_HASH_//';
+const PWD_TAG = '\n//_B64DLL_PWD_//';
 const DEFAULT_OVERWRITE_MODE = 'ask'; // ask | overwrite | rename | cancel
 
 const c = {
@@ -16,8 +18,75 @@ const c = {
   dim: "\x1b[2m",
   green: "\x1b[32m",
   cyan: "\x1b[36m",
-  red: "\x1b[31m"
+  red: "\x1b[31m",
+  yellow: "\x1b[33m",
+  magenta: "\x1b[35m"
 };
+
+// ─── ШИФРОВАНИЕ ПАРОЛЕМ (AES-256-CBC) ───────────────────────────────
+
+function deriveKey(password, salt) {
+  return crypto.pbkdf2Sync(password, salt, 100000, 32, 'sha512');
+}
+
+function encryptWithPassword(data, password) {
+  const salt = crypto.randomBytes(16);
+  const iv = crypto.randomBytes(16);
+  const key = deriveKey(password, salt);
+  const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
+  const encrypted = Buffer.concat([cipher.update(data), cipher.final()]);
+  // Формат: salt(16) + iv(16) + encrypted_data
+  return Buffer.concat([salt, iv, encrypted]);
+}
+
+function decryptWithPassword(encryptedData, password) {
+  const salt = encryptedData.subarray(0, 16);
+  const iv = encryptedData.subarray(16, 32);
+  const data = encryptedData.subarray(32);
+  const key = deriveKey(password, salt);
+  const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
+  return Buffer.concat([decipher.update(data), decipher.final()]);
+}
+
+// ─── ХЕШИРОВАНИЕ (MD5 + SHA256) ─────────────────────────────────────
+
+function computeHashes(buffer) {
+  const md5 = crypto.createHash('md5').update(buffer).digest('hex');
+  const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
+  return { md5, sha256 };
+}
+
+function encodeHashTag(hashes) {
+  return `${hashes.md5}|${hashes.sha256}`;
+}
+
+function decodeHashTag(tagContent) {
+  const parts = tagContent.split('|');
+  if (parts.length === 2) return { md5: parts[0], sha256: parts[1] };
+  return null;
+}
+
+// ─── ПРОГРЕСС-БАР (стилизованный) ───────────────────────────────────
+
+function drawProgressBar(label, processed, total) {
+  const percent = total ? Math.min(100, Math.floor((processed / total) * 100)) : 0;
+  const barWidth = 30;
+  const filled = Math.floor((percent / 100) * barWidth);
+  const empty = barWidth - filled;
+
+  // Уникальный символ "проглатывания" — como пакман
+  const head = filled > 0 ? 'ᗧ' : '';
+  const body = 'ᗣ'.repeat(Math.max(0, filled - 1));
+  const trail = '·'.repeat(empty);
+
+  const bar = `${c.green}${head}${body}${c.dim}${trail}${c.reset}`;
+  const pct = `${c.cyan}${String(percent).padStart(3)}%${c.reset}`;
+  const size = `${c.dim}${formatBytes(processed)} / ${formatBytes(total)}${c.reset}`;
+
+  process.stdout.write(`\r  ${bar} ${pct}  ${size}        `);
+}
+
+// ─── УТИЛИТЫ ────────────────────────────────────────────────────────
 
 function cleanPath(p) {
   if (!p) return p;
@@ -58,15 +127,14 @@ function copyToClipboard(text) {
   });
 }
 
-// Безопасная атомная запись файла: сначала пишем во временный, потом переименовываем
-// Это блокирует повреждение файлов при краше или резком закрытии программы.
+// Безопасная атомарная запись файла
 async function safeWriteFile(filePath, data) {
   const tempPath = `${filePath}.${crypto.randomBytes(4).toString('hex')}.tmp`;
   try {
     await fs.writeFile(tempPath, data);
     await fs.rename(tempPath, filePath);
   } catch (err) {
-    try { await fs.unlink(tempPath); } catch (e) {} // очистка мусора при ошибке
+    try { await fs.unlink(tempPath); } catch (e) {}
     throw err;
   }
 }
@@ -120,51 +188,99 @@ async function resolveOutputPath(filePath, rl, overwriteMode = DEFAULT_OVERWRITE
   }
 }
 
+// ─── ПОТОКОВОЕ КОДИРОВАНИЕ/ДЕКОДИРОВАНИЕ (worker) ───────────────────
+
 function reportProgress(processed, total) {
   if (!parentPort || !total) return;
   parentPort.postMessage({ type: 'progress', processed, total });
 }
 
-async function encodeFileStream(inPath, outPath) {
+async function encodeFileStream(inPath, outPath, password) {
   const tempPath = `${outPath}.${crypto.randomBytes(4).toString('hex')}.tmp`;
   let processed = 0;
   const total = (await fs.stat(inPath)).size;
+  const originalBuffer = await fs.readFile(inPath);
+
+  // Вычисляем хеш оригинального файла
+  const hashes = computeHashes(originalBuffer);
+  const hashTagContent = encodeHashTag(hashes);
+
+  // Шифруем данные если есть пароль
+  let dataToEncode;
+  if (password) {
+    dataToEncode = encryptWithPassword(originalBuffer, password);
+  } else {
+    dataToEncode = originalBuffer;
+  }
+
+  // Кодируем в Base64 потоково из буфера (не из файла, т.к. данные могут быть зашифрованы)
   await new Promise((resolve, reject) => {
-    const rs = fsSync.createReadStream(inPath);
+    const totalToEncode = dataToEncode.length;
+    const chunkSize = 64 * 1024;
+    let offset = 0;
     const ws = fsSync.createWriteStream(tempPath);
     let leftover = Buffer.alloc(0);
 
-    rs.on('data', chunk => {
-      processed += chunk.length;
-      const combined = Buffer.concat([leftover, chunk]);
-      const remainder = combined.length % 3;
-      const toEncode = combined.subarray(0, combined.length - remainder);
-      leftover = combined.subarray(combined.length - remainder);
-      if (toEncode.length > 0) {
-        ws.write(toEncode.toString('base64'));
-      }
-      reportProgress(processed, total);
-    });
+    function readNextChunk() {
+      while (offset < totalToEncode) {
+        const end = Math.min(offset + chunkSize, totalToEncode);
+        const chunk = dataToEncode.subarray(offset, end);
+        offset = end;
+        processed = offset;
 
-    rs.on('end', () => {
+        const combined = Buffer.concat([leftover, chunk]);
+        const remainder = combined.length % 3;
+        const toEncode = combined.subarray(0, combined.length - remainder);
+        leftover = combined.subarray(combined.length - remainder);
+        if (toEncode.length > 0) {
+          if (!ws.write(toEncode.toString('base64'))) {
+            ws.once('drain', readNextChunk);
+            return;
+          }
+        }
+        reportProgress(processed, totalToEncode);
+      }
+      // Все данные прочитаны
       if (leftover.length > 0) {
         ws.write(leftover.toString('base64'));
       }
+      if (password) {
+        ws.write(PWD_TAG);
+      }
+      ws.write(`${HASH_TAG}${hashTagContent}${HASH_TAG}`);
       ws.write(META_TAG);
       ws.end();
-    });
+    }
 
     ws.on('finish', resolve);
-    rs.on('error', err => { ws.end(); fsSync.unlink(tempPath, ()=>{}); reject(err); });
-    ws.on('error', err => { rs.destroy(); fsSync.unlink(tempPath, ()=>{}); reject(err); });
+    ws.on('error', err => { ws.end(); reject(err); });
+
+    readNextChunk();
   });
   await fs.rename(tempPath, outPath);
 }
 
-async function decodeFileStream(inPath, currentOutFileName) {
+async function decodeFileStream(inPath, currentOutFileName, password) {
   const tempPath = `${currentOutFileName}.${crypto.randomBytes(4).toString('hex')}.tmp`;
   let processed = 0;
   const total = (await fs.stat(inPath)).size;
+
+  // Читаем конец оригинального файла ДО стриминга чтобы определить теги
+  const probeSize = Math.min(2048, total);
+  const probeBuf = Buffer.alloc(probeSize);
+  const probeFd = await fs.open(inPath, 'r');
+  await probeFd.read(probeBuf, 0, probeSize, Math.max(0, total - probeSize));
+  await probeFd.close();
+  const probeText = probeBuf.toString('utf-8');
+  const hasPwdTag = probeText.includes('//_B64DLL_PWD_//');
+  const hasHashTag = probeText.includes('//_B64DLL_HASH_//');
+
+  // Если есть тег пароля но пароль не передан — сразу сообщаем
+  if (hasPwdTag && !password) {
+    throw new Error('PASSWORD_REQUIRED');
+  }
+
+  // Стриминговое декодирование
   await new Promise((resolve, reject) => {
     const rs = fsSync.createReadStream(inPath, { encoding: 'utf8', highWaterMark: 64 * 1024 });
     const ws = fsSync.createWriteStream(tempPath);
@@ -179,6 +295,12 @@ async function decodeFileStream(inPath, currentOutFileName) {
       }
 
       let text = b64Leftover + chunk;
+
+      // Удаляем все теги ДО фильтрации base64
+      // (PWD и HASH теги содержат валидные base64 символы: B, 6, 4, D, L)
+      text = text.replace(/\/\/_B64DLL_PWD_\/\//g, '');
+      text = text.replace(/\/\/_B64DLL_HASH_\/\/[^/]*\/\/_B64DLL_HASH_\/\//g, '');
+
       const sigIndex = text.indexOf('//_B64DLL_TOOL_SIG_//');
       if (sigIndex !== -1) {
         text = text.slice(0, sigIndex);
@@ -197,10 +319,13 @@ async function decodeFileStream(inPath, currentOutFileName) {
     });
 
     rs.on('end', () => {
-      const sigIndex = b64Leftover.indexOf('//_B64DLL_TOOL_SIG_//');
-      if (sigIndex !== -1) b64Leftover = b64Leftover.slice(0, sigIndex);
-      b64Leftover = b64Leftover.replace(/[^A-Za-z0-9+/=]/g, '');
-      if (b64Leftover.length > 0) ws.write(Buffer.from(b64Leftover, 'base64'));
+      let tail = b64Leftover;
+      tail = tail.replace(/\/\/_B64DLL_PWD_\/\//g, '');
+      tail = tail.replace(/\/\/_B64DLL_HASH_\/\/[^/]*\/\/_B64DLL_HASH_\/\//g, '');
+      const sigIndex = tail.indexOf('//_B64DLL_TOOL_SIG_//');
+      if (sigIndex !== -1) tail = tail.slice(0, sigIndex);
+      tail = tail.replace(/[^A-Za-z0-9+/=]/g, '');
+      if (tail.length > 0) ws.write(Buffer.from(tail, 'base64'));
       ws.end();
     });
 
@@ -208,6 +333,29 @@ async function decodeFileStream(inPath, currentOutFileName) {
     rs.on('error', err => { ws.end(); fsSync.unlink(tempPath, ()=>{}); reject(err); });
     ws.on('error', err => { rs.destroy(); fsSync.unlink(tempPath, ()=>{}); reject(err); });
   });
+
+  // Читаем декодированные данные
+  let decodedBuffer = await fs.readFile(tempPath);
+
+  // Извлекаем хеш из оригинального файла (теги уже были удалены в стриме)
+  let storedHashes = null;
+  if (hasHashTag) {
+    const hashProbe = probeText.match(/\/\/_B64DLL_HASH_\/\/(.*?)\/\/_B64DLL_HASH_\/\//);
+    if (hashProbe) storedHashes = decodeHashTag(hashProbe[1]);
+  }
+
+  // Если был пароль — расшифровываем
+  if (hasPwdTag && password) {
+    try {
+      decodedBuffer = decryptWithPassword(decodedBuffer, password);
+    } catch (err) {
+      try { await fs.unlink(tempPath); } catch(e) {}
+      throw new Error('DECRYPTION_FAILED');
+    }
+  }
+
+  // Записываем финальный результат
+  await fs.writeFile(tempPath, decodedBuffer);
 
   let finalOutFileName = currentOutFileName;
   if (!finalOutFileName.includes('.') || finalOutFileName.endsWith('_decoded')) {
@@ -224,8 +372,22 @@ async function decodeFileStream(inPath, currentOutFileName) {
       finalOutFileName = await createUniquePath(finalOutFileName);
   }
   await fs.rename(tempPath, finalOutFileName);
-  return finalOutFileName;
+
+  // Проверяем целостность
+  let integrityResult = null;
+  if (storedHashes) {
+    const currentHashes = computeHashes(decodedBuffer);
+    integrityResult = {
+      stored: storedHashes,
+      computed: currentHashes,
+      match: storedHashes.md5 === currentHashes.md5 && storedHashes.sha256 === currentHashes.sha256
+    };
+  }
+
+  return { outPath: finalOutFileName, integrity: integrityResult };
 }
+
+// ─── ДЕТЕКЦИЯ ФОРМАТОВ ──────────────────────────────────────────────
 
 function detectZipBasedFormat(buffer) {
   const text = buffer.toString('latin1');
@@ -247,7 +409,6 @@ function detectTextFormat(buffer) {
   return null;
 }
 
-// Магические байты для автоопределения форматов
 function detectSignature(buffer) {
   if (buffer.length < 2) return null;
   const hex = buffer.toString('hex', 0, Math.min(buffer.length, 12)).toUpperCase();
@@ -280,9 +441,11 @@ function detectSignature(buffer) {
   return detectTextFormat(buffer);
 }
 
-function runFileWorker(action, inPath, outPath, onProgress) {
+// ─── WORKER ─────────────────────────────────────────────────────────
+
+function runFileWorker(action, inPath, outPath, password, onProgress) {
   return new Promise((resolve, reject) => {
-    const worker = new Worker(__filename, { workerData: { action, inPath, outPath } });
+    const worker = new Worker(__filename, { workerData: { action, inPath, outPath, password } });
     worker.on('message', message => {
       if (message.type === 'progress') onProgress(message.processed, message.total);
       if (message.type === 'done') resolve(message);
@@ -295,24 +458,57 @@ function runFileWorker(action, inPath, outPath, onProgress) {
   });
 }
 
-function printProgress(label, processed, total) {
-  const percent = total ? Math.min(100, Math.floor((processed / total) * 100)) : 0;
-  process.stdout.write(`\r${c.dim}${label}: ${percent}% | ${formatBytes(processed)} / ${formatBytes(total)}${c.reset}        `);
-}
-
 async function runWorkerMode() {
   try {
     if (workerData.action === 'encode') {
-      await encodeFileStream(workerData.inPath, workerData.outPath);
+      await encodeFileStream(workerData.inPath, workerData.outPath, workerData.password);
       parentPort.postMessage({ type: 'done', outPath: workerData.outPath });
     } else if (workerData.action === 'decode') {
-      const finalOutName = await decodeFileStream(workerData.inPath, workerData.outPath);
-      parentPort.postMessage({ type: 'done', outPath: finalOutName });
+      const result = await decodeFileStream(workerData.inPath, workerData.outPath, workerData.password);
+      parentPort.postMessage({ type: 'done', outPath: result.outPath, integrity: result.integrity });
     }
   } catch (err) {
     parentPort.postMessage({ type: 'error', message: err.message });
   }
 }
+
+// ─── ЭКСПОРТ ИНФОРМАЦИИ ────────────────────────────────────────────
+
+async function exportInfo(infoData, filePath, rl) {
+  const answer = (await rl.question(
+    `${c.cyan}Сохранить информацию в файл? (y/n): ${c.reset}`
+  )).trim().toLowerCase();
+
+  if (answer !== 'y' && answer !== 'н') return;
+
+  const exportFormat = (await rl.question(
+    `${c.cyan}[1]${c.reset} JSON\n` +
+    `${c.cyan}[2]${c.reset} Текстовый файл\n` +
+    `${c.cyan}> ${c.reset}`
+  )).trim();
+
+  const baseName = path.basename(filePath, path.extname(filePath));
+  let exportPath;
+  let content;
+
+  if (exportFormat === '1') {
+    exportPath = `${baseName}_info.json`;
+    content = JSON.stringify(infoData, null, 2);
+  } else {
+    exportPath = `${baseName}_info.txt`;
+    content = Object.entries(infoData)
+      .map(([key, val]) => `${key}: ${val}`)
+      .join('\n');
+  }
+
+  exportPath = await resolveOutputPath(exportPath, rl);
+  if (exportPath) {
+    await safeWriteFile(exportPath, content);
+    console.log(`${c.green}Информация сохранена в "${exportPath}"${c.reset}\n`);
+  }
+}
+
+// ─── MAIN ───────────────────────────────────────────────────────────
 
 if (!isMainThread) {
   runWorkerMode();
@@ -356,15 +552,38 @@ ${c.bright}${c.cyan} ____                 __   _  _        ____  _     _
         console.log(`\n${c.cyan}--- ТЕКСТ В DLL ---${c.reset}`);
         let name = cleanPath(await rl.question(`${c.bright}Введите имя файла (без .dll): ${c.reset}`));
         const content = await rl.question(`${c.bright}Введите содержание (текст): ${c.reset}`);
+
+        // Спрашиваем про пароль (опционально)
+        const usePassword1 = (await rl.question(`${c.cyan}Задать пароль? (y/n): ${c.reset}`)).trim().toLowerCase();
+        let password1 = null;
+        if (usePassword1 === 'y' || usePassword1 === 'н') {
+          password1 = await rl.question(`${c.bright}Введите пароль: ${c.reset}`);
+        }
+
         const outPath = await resolveOutputPath(`${name}.dll`, rl);
         if (!outPath) {
           console.log(`${c.red}Операция отменена.${c.reset}\n`);
         } else {
           process.stdout.write(`\n${c.dim}Кодирование...${c.reset}`);
           await sleep(400);
-          const encodedContent = encodeContent(content) + META_TAG;
-          await safeWriteFile(outPath, encodedContent);
-          console.log(`\r${c.green}${c.bright}УСПЕХ! Текст зашифрован и сохранен в "${outPath}".${c.reset}\n`);
+          let encodedContent = encodeContent(content);
+
+          // Если пароль — шифруем
+          if (password1) {
+            const encrypted = encryptWithPassword(Buffer.from(content, 'utf-8'), password1);
+            encodedContent = encrypted.toString('base64');
+          }
+
+          const hashBuf = Buffer.from(content, 'utf-8');
+          const hashes = computeHashes(hashBuf);
+          const hashTag = `${HASH_TAG}${encodeHashTag(hashes)}${HASH_TAG}`;
+          const pwdTag = password1 ? PWD_TAG : '';
+          const finalContent = encodedContent + pwdTag + hashTag + META_TAG;
+
+          await safeWriteFile(outPath, finalContent);
+          console.log(`\r${c.green}${c.bright}УСПЕХ! Текст зашифрован и сохранен в "${outPath}".${c.reset}`);
+          if (password1) console.log(`${c.yellow}Файл зашифрован паролем.${c.reset}`);
+          console.log(`${c.dim}Целостность: MD5=${hashes.md5.substring(0,16)}... SHA256=${hashes.sha256.substring(0,16)}...${c.reset}\n`);
         }
 
       } else if (mode.trim() === '2') {
@@ -381,12 +600,59 @@ ${c.bright}${c.cyan} ____                 __   _  _        ____  _     _
 
           try {
             let rawData = await fs.readFile(fileName, 'utf-8');
+
+            // Проверяем наличие тега пароля
+            const hasPwd = rawData.includes('//_B64DLL_PWD_//');
+            let password2 = null;
+            if (hasPwd) {
+              password2 = await rl.question(`${c.yellow}Файл зашифрован паролем. Введите пароль: ${c.reset}`);
+            }
+
+            // Проверяем наличие тега хеша
+            let storedHashes = null;
+            const hashMatch = rawData.match(/\/\/_B64DLL_HASH_\/\/(.*?)\/\/_B64DLL_HASH_\/\//);
+            if (hashMatch) {
+              storedHashes = decodeHashTag(hashMatch[1]);
+            }
+
             if (rawData.includes('//_B64DLL_TOOL_SIG_//')) {
                  rawData = rawData.replace('//_B64DLL_TOOL_SIG_//', '');
             }
-            const decodedContent = decodeContent(rawData.replace(/[^A-Za-z0-9+/=]/g, ''));
+            if (rawData.includes('//_B64DLL_PWD_//')) {
+                 rawData = rawData.replace('//_B64DLL_PWD_//', '');
+            }
+            if (hashMatch) {
+              rawData = rawData.replace(/\/\/_B64DLL_HASH_\/\/.*?\/\/_B64DLL_HASH_\/\//, '');
+            }
+
+            let decodedBuffer = Buffer.from(rawData.replace(/[^A-Za-z0-9+/=]/g, ''), 'base64');
+
+            // Расшифровываем если был пароль
+            if (hasPwd && password2) {
+              try {
+                decodedBuffer = decryptWithPassword(decodedBuffer, password2);
+              } catch (err) {
+                console.log(`\r${c.red}${c.bright}ОШИБКА: Неверный пароль или поврежденные данные.${c.reset}\n`);
+                continue;
+              }
+            }
+
+            const decodedContent = decodedBuffer.toString('utf-8');
             await safeWriteFile(outPath, decodedContent);
             console.log(`\r${c.green}${c.bright}УСПЕХ! Файл "${fileName}" декодирован в "${outPath}".${c.reset}`);
+
+            // Проверка целостности
+            if (storedHashes) {
+              const currentHashes = computeHashes(decodedBuffer);
+              const match = storedHashes.md5 === currentHashes.md5 && storedHashes.sha256 === currentHashes.sha256;
+              if (match) {
+                console.log(`${c.green}${c.bright}Целостность подтверждена: хеш совпадает.${c.reset}`);
+              } else {
+                console.log(`${c.red}${c.bright}ВНИМАНИЕ: хеш не совпадает! Файл мог быть поврежден.${c.reset}`);
+                console.log(`${c.dim}Ожидалось: MD5=${storedHashes.md5.substring(0,16)}...${c.reset}`);
+                console.log(`${c.dim}Получено:  MD5=${currentHashes.md5.substring(0,16)}...${c.reset}`);
+              }
+            }
 
             const answer = await rl.question(`${c.cyan}Скопировать текст в буфер обмена? (y/n): ${c.reset}`);
             if (answer.toLowerCase() === 'y' || answer.toLowerCase() === 'н') {
@@ -410,15 +676,25 @@ ${c.bright}${c.cyan} ____                 __   _  _        ____  _     _
 
         try {
           const stats = await fs.stat(filePath);
+
+          // Спрашиваем про пароль (опционально)
+          const usePassword3 = (await rl.question(`${c.cyan}Задать пароль? (y/n): ${c.reset}`)).trim().toLowerCase();
+          let password3 = null;
+          if (usePassword3 === 'y' || usePassword3 === 'н') {
+            password3 = await rl.question(`${c.bright}Введите пароль: ${c.reset}`);
+          }
+
           let outFileName = `${path.basename(filePath)}.dll`;
           outFileName = await resolveOutputPath(outFileName, rl);
           if (!outFileName) {
             console.log(`${c.red}Операция отменена.${c.reset}\n`);
           } else {
             console.log(`\n${c.dim}Чтение файла (${formatBytes(stats.size)})...${c.reset}`);
-            const result = await runFileWorker('encode', filePath, outFileName, (processed, total) => printProgress('Потоковое кодирование', processed, total));
+            const result = await runFileWorker('encode', filePath, outFileName, password3, (processed, total) => drawProgressBar('Кодирование', processed, total));
             const outStats = await fs.stat(result.outPath);
-            console.log(`\r${c.green}${c.bright}УСПЕХ! Файл "${path.basename(filePath)}" превращен в "${result.outPath}".${c.reset} \n${c.dim}Размер DLL: ${formatBytes(outStats.size)}${c.reset}\n`);
+            console.log(`\r${c.green}${c.bright}УСПЕХ! Файл "${path.basename(filePath)}" превращен в "${result.outPath}".${c.reset} \n${c.dim}Размер DLL: ${formatBytes(outStats.size)}${c.reset}`);
+            if (password3) console.log(`${c.yellow}Файл зашифрован паролем.${c.reset}`);
+            console.log();
           }
         } catch (e) {
           if (e.code === 'ENOENT') {
@@ -435,6 +711,18 @@ ${c.bright}${c.cyan} ____                 __   _  _        ____  _     _
           try { await fs.access(filePath); } catch { filePath += '.dll'; }
         }
 
+        // Проверяем есть ли пароль в файле
+        let needPassword = false;
+        try {
+          const probeData = await fs.readFile(filePath, 'utf-8');
+          needPassword = probeData.includes('//_B64DLL_PWD_//');
+        } catch(e) {}
+
+        let password4 = null;
+        if (needPassword) {
+          password4 = await rl.question(`${c.yellow}Файл зашифрован паролем. Введите пароль: ${c.reset}`);
+        }
+
         try {
           let outFileName = filePath;
           if (outFileName.toLowerCase().endsWith('.dll')) {
@@ -447,12 +735,28 @@ ${c.bright}${c.cyan} ____                 __   _  _        ____  _     _
             console.log(`${c.red}Операция отменена.${c.reset}\n`);
           } else {
             console.log(`\n${c.dim}Чтение закодированных данных...${c.reset}`);
-            const result = await runFileWorker('decode', filePath, outFileName, (processed, total) => printProgress('Потоковое декодирование', processed, total));
+            const result = await runFileWorker('decode', filePath, outFileName, password4, (processed, total) => drawProgressBar('Декодирование', processed, total));
             const outStats = await fs.stat(result.outPath);
-            console.log(`\r${c.green}${c.bright}УСПЕХ! DLL декодирован обратно в файл "${result.outPath}".${c.reset} \n${c.dim}Восстановленный размер: ${formatBytes(outStats.size)}${c.reset}\n`);
+            console.log(`\r${c.green}${c.bright}УСПЕХ! DLL декодирован обратно в файл "${result.outPath}".${c.reset} \n${c.dim}Восстановленный размер: ${formatBytes(outStats.size)}${c.reset}`);
+
+            // Проверка целостности
+            if (result.integrity) {
+              if (result.integrity.match) {
+                console.log(`${c.green}${c.bright}Целостность подтверждена: хеш совпадает.${c.reset}`);
+              } else {
+                console.log(`${c.red}${c.bright}ВНИМАНИЕ: хеш не совпадает! Файл мог быть поврежден.${c.reset}`);
+                console.log(`${c.dim}Ожидалось: MD5=${result.integrity.stored.md5.substring(0,16)}...${c.reset}`);
+                console.log(`${c.dim}Получено:  MD5=${result.integrity.computed.md5.substring(0,16)}...${c.reset}`);
+              }
+            }
+            console.log();
           }
         } catch (e) {
-          if (e.code === 'ENOENT') {
+          if (e.message === 'PASSWORD_REQUIRED') {
+            console.log(`\r${c.red}${c.bright}ОШИБКА: Файл зашифрован, но пароль не был введен!${c.reset}\n`);
+          } else if (e.message === 'DECRYPTION_FAILED') {
+            console.log(`\r${c.red}${c.bright}ОШИБКА: Неверный пароль или поврежденные данные.${c.reset}\n`);
+          } else if (e.code === 'ENOENT') {
             console.log(`\r${c.red}${c.bright}ОШИБКА: Файл "${filePath}" не найден!${c.reset}\n`);
           } else {
             console.log(`\r${c.red}${c.bright}ОШИБКА: ${e.message}${c.reset}\n`);
@@ -472,7 +776,6 @@ ${c.bright}${c.cyan} ____                 __   _  _        ____  _     _
           const buffer = Buffer.alloc(Math.min(1024, stats.size));
           await fd.read(buffer, 0, buffer.length, 0);
 
-          // Чтение конца файла для проверки сигнатуры
           const tailBuf = Buffer.alloc(Math.min(1024, stats.size));
           const readEndPos = Math.max(0, stats.size - tailBuf.length);
           await fd.read(tailBuf, 0, tailBuf.length, readEndPos);
@@ -480,6 +783,8 @@ ${c.bright}${c.cyan} ____                 __   _  _        ____  _     _
 
           const tailText = tailBuf.toString('utf-8');
           const isSigned = tailText.includes('//_B64DLL_TOOL_SIG_//');
+          const hasPassword = tailText.includes('//_B64DLL_PWD_//');
+          const hasHash = tailText.includes('//_B64DLL_HASH_//');
           const rawPrefix = buffer.toString('utf-8').replace(/[^a-zA-Z0-9+/=]/g, '').substring(0, 768);
           const decodedPrefixBuffer = Buffer.from(rawPrefix, 'base64');
           const detectedExt = detectSignature(decodedPrefixBuffer);
@@ -496,6 +801,18 @@ ${c.bright}${c.cyan} ____                 __   _  _        ____  _     _
               console.log(`${c.red}${c.bright}• Метка Base64 DLL Tool не найдена${c.reset}`);
           }
 
+          if (hasPassword) {
+              console.log(`${c.yellow}${c.bright}• Защита: файл зашифрован паролем${c.reset}`);
+          } else {
+              console.log(`${c.dim}• Защита: без пароля${c.reset}`);
+          }
+
+          if (hasHash) {
+              console.log(`${c.green}${c.bright}• Целостность: хеш сохранен (MD5 + SHA256)${c.reset}`);
+          } else {
+              console.log(`${c.dim}• Целостность: хеш не записан${c.reset}`);
+          }
+
           const originalSizeApprox = Math.floor((stats.size / 4) * 3);
           console.log(`${c.bright}• Ожидаемый размер после декода: ${c.reset}~${formatBytes(originalSizeApprox)}`);
           console.log(`${c.bright}• Предполагаемый формат после декода: ${c.reset}${detectedExt || 'не определен'}`);
@@ -504,6 +821,23 @@ ${c.bright}${c.cyan} ____                 __   _  _        ____  _     _
           const decodedPrefix = decodedPrefixBuffer.toString('ascii').replace(/[\x00-\x1F\x7F-\x9F]/g, '.').substring(0, 60);
           console.log(`${c.bright}• Анализ заголовка (ascii): ${c.reset}${decodedPrefix}`);
           console.log();
+
+          // Экспорт информации
+          const infoData = {
+            fileName: path.basename(filePath),
+            fileSize: formatBytes(stats.size),
+            fileSizeBytes: stats.size,
+            base64Valid: looksLikeBase64,
+            signedByTool: isSigned,
+            passwordProtected: hasPassword,
+            hashStored: hasHash,
+            estimatedDecodedSize: `~${formatBytes(originalSizeApprox)}`,
+            estimatedDecodedSizeBytes: Math.floor((stats.size / 4) * 3),
+            predictedFormat: detectedExt || 'не определен',
+            codeSignature: rawPrefix.substring(0, 40) + '...',
+            headerAnalysis: decodedPrefix
+          };
+          await exportInfo(infoData, filePath, rl);
 
         } catch (e) {
           console.log(`\n${c.red}${c.bright}ОШИБКА чтения: ${e.message}${c.reset}\n`);
