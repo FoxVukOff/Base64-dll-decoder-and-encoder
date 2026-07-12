@@ -213,40 +213,49 @@ async function encodeFileStream(inPath, outPath, password) {
     dataToEncode = originalBuffer;
   }
 
-  // Кодируем в Base64 потоково
+  // Кодируем в Base64 потоково из буфера (не из файла, т.к. данные могут быть зашифрованы)
   await new Promise((resolve, reject) => {
-    const rs = fsSync.createReadStream(inPath);
+    const totalToEncode = dataToEncode.length;
+    const chunkSize = 64 * 1024;
+    let offset = 0;
     const ws = fsSync.createWriteStream(tempPath);
     let leftover = Buffer.alloc(0);
 
-    rs.on('data', chunk => {
-      processed += chunk.length;
-      const combined = Buffer.concat([leftover, chunk]);
-      const remainder = combined.length % 3;
-      const toEncode = combined.subarray(0, combined.length - remainder);
-      leftover = combined.subarray(combined.length - remainder);
-      if (toEncode.length > 0) {
-        ws.write(toEncode.toString('base64'));
-      }
-      reportProgress(processed, total);
-    });
+    function readNextChunk() {
+      while (offset < totalToEncode) {
+        const end = Math.min(offset + chunkSize, totalToEncode);
+        const chunk = dataToEncode.subarray(offset, end);
+        offset = end;
+        processed = offset;
 
-    rs.on('end', () => {
+        const combined = Buffer.concat([leftover, chunk]);
+        const remainder = combined.length % 3;
+        const toEncode = combined.subarray(0, combined.length - remainder);
+        leftover = combined.subarray(combined.length - remainder);
+        if (toEncode.length > 0) {
+          if (!ws.write(toEncode.toString('base64'))) {
+            ws.once('drain', readNextChunk);
+            return;
+          }
+        }
+        reportProgress(processed, totalToEncode);
+      }
+      // Все данные прочитаны
       if (leftover.length > 0) {
         ws.write(leftover.toString('base64'));
       }
-      // Добавляем теги
       if (password) {
         ws.write(PWD_TAG);
       }
       ws.write(`${HASH_TAG}${hashTagContent}${HASH_TAG}`);
       ws.write(META_TAG);
       ws.end();
-    });
+    }
 
     ws.on('finish', resolve);
-    rs.on('error', err => { ws.end(); fsSync.unlink(tempPath, ()=>{}); reject(err); });
-    ws.on('error', err => { rs.destroy(); fsSync.unlink(tempPath, ()=>{}); reject(err); });
+    ws.on('error', err => { ws.end(); reject(err); });
+
+    readNextChunk();
   });
   await fs.rename(tempPath, outPath);
 }
@@ -255,6 +264,23 @@ async function decodeFileStream(inPath, currentOutFileName, password) {
   const tempPath = `${currentOutFileName}.${crypto.randomBytes(4).toString('hex')}.tmp`;
   let processed = 0;
   const total = (await fs.stat(inPath)).size;
+
+  // Читаем конец оригинального файла ДО стриминга чтобы определить теги
+  const probeSize = Math.min(2048, total);
+  const probeBuf = Buffer.alloc(probeSize);
+  const probeFd = await fs.open(inPath, 'r');
+  await probeFd.read(probeBuf, 0, probeSize, Math.max(0, total - probeSize));
+  await probeFd.close();
+  const probeText = probeBuf.toString('utf-8');
+  const hasPwdTag = probeText.includes('//_B64DLL_PWD_//');
+  const hasHashTag = probeText.includes('//_B64DLL_HASH_//');
+
+  // Если есть тег пароля но пароль не передан — сразу сообщаем
+  if (hasPwdTag && !password) {
+    throw new Error('PASSWORD_REQUIRED');
+  }
+
+  // Стриминговое декодирование
   await new Promise((resolve, reject) => {
     const rs = fsSync.createReadStream(inPath, { encoding: 'utf8', highWaterMark: 64 * 1024 });
     const ws = fsSync.createWriteStream(tempPath);
@@ -269,6 +295,12 @@ async function decodeFileStream(inPath, currentOutFileName, password) {
       }
 
       let text = b64Leftover + chunk;
+
+      // Удаляем все теги ДО фильтрации base64
+      // (PWD и HASH теги содержат валидные base64 символы: B, 6, 4, D, L)
+      text = text.replace(/\/\/_B64DLL_PWD_\/\//g, '');
+      text = text.replace(/\/\/_B64DLL_HASH_\/\/[^/]*\/\/_B64DLL_HASH_\/\//g, '');
+
       const sigIndex = text.indexOf('//_B64DLL_TOOL_SIG_//');
       if (sigIndex !== -1) {
         text = text.slice(0, sigIndex);
@@ -287,10 +319,13 @@ async function decodeFileStream(inPath, currentOutFileName, password) {
     });
 
     rs.on('end', () => {
-      const sigIndex = b64Leftover.indexOf('//_B64DLL_TOOL_SIG_//');
-      if (sigIndex !== -1) b64Leftover = b64Leftover.slice(0, sigIndex);
-      b64Leftover = b64Leftover.replace(/[^A-Za-z0-9+/=]/g, '');
-      if (b64Leftover.length > 0) ws.write(Buffer.from(b64Leftover, 'base64'));
+      let tail = b64Leftover;
+      tail = tail.replace(/\/\/_B64DLL_PWD_\/\//g, '');
+      tail = tail.replace(/\/\/_B64DLL_HASH_\/\/[^/]*\/\/_B64DLL_HASH_\/\//g, '');
+      const sigIndex = tail.indexOf('//_B64DLL_TOOL_SIG_//');
+      if (sigIndex !== -1) tail = tail.slice(0, sigIndex);
+      tail = tail.replace(/[^A-Za-z0-9+/=]/g, '');
+      if (tail.length > 0) ws.write(Buffer.from(tail, 'base64'));
       ws.end();
     });
 
@@ -299,31 +334,14 @@ async function decodeFileStream(inPath, currentOutFileName, password) {
     ws.on('error', err => { rs.destroy(); fsSync.unlink(tempPath, ()=>{}); reject(err); });
   });
 
-  // Читаем декодированные данные и обрабатываем теги
+  // Читаем декодированные данные
   let decodedBuffer = await fs.readFile(tempPath);
-  let decodedText = decodedBuffer.toString('utf-8');
 
-  // Проверяем наличие тега пароля
-  const hasPwdTag = decodedText.includes('//_B64DLL_PWD_//');
-  if (hasPwdTag) {
-    if (!password) {
-      // Удаляем временный файл и сообщаем что нужен пароль
-      try { await fs.unlink(tempPath); } catch(e) {}
-      throw new Error('PASSWORD_REQUIRED');
-    }
-    // Удаляем тег пароля из данных
-    decodedText = decodedText.replace('//_B64DLL_PWD_//', '');
-    decodedBuffer = Buffer.from(decodedText, 'utf-8');
-  }
-
-  // Извлекаем хеш если есть
+  // Извлекаем хеш из оригинального файла (теги уже были удалены в стриме)
   let storedHashes = null;
-  const hashMatch = decodedText.match(/\/\/_B64DLL_HASH_\/\/(.*?)\/\/_B64DLL_HASH_\/\//);
-  if (hashMatch) {
-    storedHashes = decodeHashTag(hashMatch[1]);
-    // Удаляем тег хеша из данных
-    decodedText = decodedText.replace(/\/\/_B64DLL_HASH_\/\/.*?\/\/_B64DLL_HASH_\/\//, '');
-    decodedBuffer = Buffer.from(decodedText, 'utf-8');
+  if (hasHashTag) {
+    const hashProbe = probeText.match(/\/\/_B64DLL_HASH_\/\/(.*?)\/\/_B64DLL_HASH_\/\//);
+    if (hashProbe) storedHashes = decodeHashTag(hashProbe[1]);
   }
 
   // Если был пароль — расшифровываем
